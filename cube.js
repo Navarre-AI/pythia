@@ -62,7 +62,12 @@ async function syncTable(table, { onProgress, watermark } = {}) {
     if (mainCols.length !== names.length || !names.every((n, i) => mainCols[i] === n)) incremental = false;
   }
 
-  const rows = await fetchAllRows(table.occurrences[0], names, { onProgress, filter: incremental ? `${modField} ge ${watermark}` : undefined });
+  // Watermark comparison: `ge` (>=) only while the watermark second is recent
+  // enough that new edits could still land in it (clock-skew guard). Once it's
+  // safely in the past, strict `gt` — otherwise a bulk import that stamped
+  // thousands of rows in one second gets re-pulled on every sync forever.
+  const wmOp = watermark && Date.now() - Date.parse(watermark) > 5 * 60 * 1000 ? "gt" : "ge";
+  const rows = await fetchAllRows(table.occurrences[0], names, { onProgress, filter: incremental ? `${modField} ${wmOp} ${watermark}` : undefined });
   const newWatermark = modField ? rows.reduce((mx, r) => (r[modField] && r[modField] > mx ? r[modField] : mx), watermark || "") : null;
 
   const file = path.join(CUBE_DIR, `${name}.json`);
