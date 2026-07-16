@@ -1,0 +1,9 @@
+.env
+node_modules/
+*.log
+.DS_Store
+data/
+report-samples/
+
+# Per-install, written by setup.mjs from fly.template.toml
+fly.toml

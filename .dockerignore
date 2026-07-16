@@ -1,0 +1,15 @@
+# Nothing local, secret, or historical goes into the image.
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+data/
+node_modules/
+report-samples/
+screen-shots/
+*.log
+.DS_Store
+fly.toml
+Dockerfile
+.dockerignore

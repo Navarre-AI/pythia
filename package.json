@@ -1,0 +1,16 @@
+{
+  "name": "pythia",
+  "version": "0.1.0",
+  "description": "Pythia, the oracle at Delphi. Ask a question in plain language; get a printable report with exact numbers straight from FileMaker. Self-contained AI report generator: chat in, report out.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "setup": "node setup.mjs"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
