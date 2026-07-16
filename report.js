@@ -76,16 +76,7 @@ function kpiStrip(columns, rows) {
   return `<div class="kpis">${items.join("")}</div>`;
 }
 
-export function renderReport({ report, columns, rows, meta }) {
-  const title = report.name || "Report";
-  const chart = chartSVG(report.chart, columns, rows);
-  const thead = `<tr>${columns.map((c) => `<th>${esc(c.replace(/_/g, " "))}</th>`).join("")}</tr>`;
-  const tbody = rows.map((r) =>
-    `<tr>${columns.map((c) => `<td class="${isNum(r[c]) ? "num" : ""}">${fmt(c, r[c])}</td>`).join("")}</tr>`
-  ).join("");
-  const asOf = meta?.syncedAt ? new Date(meta.syncedAt).toLocaleString() : "unknown";
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title>
-<style>
+const REPORT_CSS = `
   :root { --ink:#241d36; --muted:#6f6690; --line:#e3dff0; --accent:#6d5bb8; }
   * { box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, sans-serif;
@@ -106,7 +97,53 @@ export function renderReport({ report, columns, rows, meta }) {
   footer { margin-top: 22px; color: var(--muted); font-size: 0.72rem; border-top: 1px solid var(--line); padding-top: 10px; }
   @media print { body { padding: 0; } thead { display: table-header-group; } tr { page-break-inside: avoid; }
     @page { margin: 14mm; } }
+`;
+
+// Multi-part report: one document, several sections, each with its own query
+// result (title, optional note, optional chart, table). Same styling + footer.
+export function renderReportParts({ report, parts, meta }) {
+  const title = report.name || "Report";
+  const asOf = meta?.syncedAt ? new Date(meta.syncedAt).toLocaleString() : "unknown";
+  const totalRows = parts.reduce((a, p) => a + p.rows.length, 0);
+  const sections = parts.map((p) => {
+    const chart = chartSVG(p.chart, p.columns, p.rows);
+    const thead = `<tr>${p.columns.map((c) => `<th>${esc(c.replace(/_/g, " "))}</th>`).join("")}</tr>`;
+    const tbody = p.rows.map((r) =>
+      `<tr>${p.columns.map((c) => `<td class="${isNum(r[c]) ? "num" : ""}">${fmt(c, r[c])}</td>`).join("")}</tr>`
+    ).join("");
+    return `<section>
+  <h2>${esc(p.title || "")}</h2>
+  ${p.note ? `<p class="desc">${esc(p.note)}</p>` : ""}
+  ${chart ? `<div class="chart">${chart}</div>` : ""}
+  <table><thead>${thead}</thead><tbody>${tbody}</tbody></table>
+</section>`;
+  }).join("\n");
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title>
+<style>${REPORT_CSS}
+  h2 { font-size: 1.08rem; margin: 26px 0 4px; padding-top: 14px; border-top: 1px solid var(--line); }
+  section:first-of-type h2 { border-top: none; margin-top: 10px; }
+  @media print { section { page-break-inside: avoid; } }
 </style></head>
+<body>
+  <h1>${esc(title)}</h1>
+  <p class="desc">${esc(report.description || "")}</p>
+  ${sections}
+  <footer>
+    Pythia · ${parts.length} sections · ${totalRows.toLocaleString()} rows · as of ${esc(asOf)}
+  </footer>
+</body></html>`;
+}
+
+export function renderReport({ report, columns, rows, meta }) {
+  const title = report.name || "Report";
+  const chart = chartSVG(report.chart, columns, rows);
+  const thead = `<tr>${columns.map((c) => `<th>${esc(c.replace(/_/g, " "))}</th>`).join("")}</tr>`;
+  const tbody = rows.map((r) =>
+    `<tr>${columns.map((c) => `<td class="${isNum(r[c]) ? "num" : ""}">${fmt(c, r[c])}</td>`).join("")}</tr>`
+  ).join("");
+  const asOf = meta?.syncedAt ? new Date(meta.syncedAt).toLocaleString() : "unknown";
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(title)}</title>
+<style>${REPORT_CSS}</style></head>
 <body>
   <h1>${esc(title)}</h1>
   <p class="desc">${esc(report.description || "")}</p>

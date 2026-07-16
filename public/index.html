@@ -281,6 +281,22 @@ function artifactCard(a) {
   const tools = el("div", "tools");
   const isChart = a.chartType === "bar" || a.chartType === "line";
   const body = el("div");
+  // Multi-part report card: list the sections; PDF/open buttons show the whole document.
+  if (a.chartType === "report") {
+    body.innerHTML = '<div style="padding:4px 2px;color:var(--muted);font-size:13px">One report, ' + (a.sections||[]).length + ' sections:</div>' +
+      '<ol style="margin:4px 0 6px;padding-left:22px;font-size:13.5px">' +
+      (a.sections||[]).map((s)=>`<li>${esc(s.title)} <span style="color:var(--muted)">(${s.rows} rows)</span></li>`).join("") + '</ol>';
+    if (a.reportId) {
+      const open = el("button", "tbtn"); open.textContent = "⧉ open report";
+      open.onclick = () => window.open(api("/report/" + a.reportId), "_blank");
+      tools.appendChild(open);
+      const pdf = el("button", "tbtn"); pdf.textContent = "⤓ PDF";
+      pdf.onclick = () => { const w = window.open(api("/report/" + a.reportId), "_blank"); if (w) w.addEventListener("load", () => setTimeout(() => w.print(), 250)); };
+      tools.appendChild(pdf);
+    }
+    h.appendChild(tools); card.append(h, body);
+    return card;
+  }
   let mode = a.chartType === "table" ? "table" : (isChart ? "chart" : "table");
   const draw = () => {
     body.innerHTML = "";

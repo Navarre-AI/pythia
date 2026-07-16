@@ -10,7 +10,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { fmConfigured, fetchSchema, fetchCounts, layoutStats } from "./fm.js";
 import { sql as cubeSql, buildCube, syncTables, reconcileCube, cubeManifest, cubeExists, sampleAvailable, loadSampleData } from "./cube.js";
-import { renderReport } from "./report.js";
+import { renderReport, renderReportParts } from "./report.js";
 import { SEED_REPORTS } from "./reports.seed.js";
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
@@ -342,7 +342,7 @@ app.post("/api/reports", (req, res) => {
   const b = req.body || {};
   let id = b.id || slug(b.name || "report");
   while (list.some((r) => r.id === id)) id += "-2";
-  const rep = { id, name: b.name || "Untitled", description: b.description || "", sql: b.sql || "", chart: b.chart || null, updatedAt: new Date().toISOString() };
+  const rep = { id, name: b.name || "Untitled", description: b.description || "", sql: b.sql || "", chart: b.chart || null, ...(Array.isArray(b.parts) && b.parts.length ? { parts: b.parts } : {}), updatedAt: new Date().toISOString() };
   list.push(rep); saveReports(list);
   res.json(rep);
 });
@@ -390,6 +390,20 @@ function buildArtifact(report, columns, rows) {
 }
 async function runReport(report) {
   await ensureData();
+  if (report.parts?.length) {
+    // Multi-part: run every section fresh, render one document.
+    const rendered = [];
+    for (const p of report.parts) {
+      try {
+        const rows = await cubeSql(p.sql);
+        rendered.push({ title: p.title, note: p.note || "", chart: p.chart, columns: rows.length ? Object.keys(rows[0]) : [], rows });
+      } catch { /* section query failed against current data; skip it */ }
+    }
+    if (!rendered.length) throw new Error("None of this report's sections ran against the current data.");
+    renderedReports.set(report.id, renderReportParts({ report, parts: rendered, meta: cubeManifest() }));
+    const artifact = { title: report.name, chartType: "report", sections: rendered.map((p) => ({ title: p.title, rows: p.rows.length })), reportId: report.id, saveable: false };
+    return { reportId: report.id, artifact, ts: new Date().toISOString() };
+  }
   const rows = await cubeSql(report.sql);
   const columns = rows.length ? Object.keys(rows[0]) : [];
   renderedReports.set(report.id, renderReport({ report, columns, rows, meta: cubeManifest() }));
@@ -480,10 +494,21 @@ const DATA_NOTES = [
 ].join("\n");
 
 const CHAT_TOOLS = [
-  { name: "query_data", description: "Run one read-only DuckDB SQL SELECT against the local copy of the FileMaker data. Quote identifiers that contain spaces or start oddly with double quotes. Returns rows as JSON.",
+  { name: "query_data", description: "Run one read-only DuckDB SQL SELECT against the local copy of the FileMaker data. Quote identifiers that contain spaces or start oddly with double quotes. Returns rows as JSON plus a queryIndex you can reference in compose_report.",
     input_schema: { type: "object", properties: { sql: { type: "string" } }, required: ["sql"] } },
   { name: "present", description: "Display the most recent query_data result to the user as a chart or table. Use bar for category comparisons, line for time series, table for detailed rows. x/y are column names from that result (needed for bar/line).",
     input_schema: { type: "object", properties: { title: { type: "string" }, chartType: { type: "string", enum: ["bar", "line", "table"] }, x: { type: "string" }, y: { type: "string" } }, required: ["title", "chartType"] } },
+  { name: "compose_report", description: "Bundle SEVERAL query results from this reply into ONE saved, printable report with multiple sections. Use when the user wants a single report with multiple parts. Run query_data (and present) for each section first, then call this once at the end. Each section references a query by its queryIndex.",
+    input_schema: { type: "object", properties: {
+      name: { type: "string" }, description: { type: "string" },
+      sections: { type: "array", items: { type: "object", properties: {
+        title: { type: "string" },
+        queryIndex: { type: "number", description: "queryIndex returned by the query_data call whose rows this section shows" },
+        chartType: { type: "string", enum: ["bar", "line", "table"] },
+        x: { type: "string" }, y: { type: "string" },
+        note: { type: "string", description: "One plain-English sentence of takeaway for this section" },
+      }, required: ["title", "queryIndex", "chartType"] } },
+    }, required: ["name", "sections"] } },
 ];
 
 app.post("/api/chat", async (req, res) => {
@@ -501,11 +526,13 @@ app.post("/api/chat", async (req, res) => {
       'Rules: (1) To get numbers, call query_data with a DuckDB SELECT. Quote identifiers with spaces like "Order Date". ' +
       "(2) After querying, call present to show the result as a chart (bar for rankings/comparisons, line for time-over-time) or table (for detailed row lists). x/y are column names from the result. " +
       "(3) Then give a 1-2 sentence plain-English takeaway the user can act on. " +
+      "If the user asks for ONE report with MULTIPLE parts/sections, run query_data (and present) for each part, then call compose_report ONCE at the end to bundle them into a single saved, printable report. " +
       "If a question needs data this database doesn't track, say so honestly and offer the closest thing you CAN answer, rather than returning a misleading chart. " +
       "PRESENTATION RULES (always): never show SQL, table names, or column names. NEVER show a UUID, internal ID, or raw foreign key in your answer or any table/chart — always resolve keys to the human label (join to the related table and show its name/title column), and never include a bare ID column. Label rows by their name, not their key. Use friendly names and plain, warm, business English.";
 
     const messages = (req.body?.messages || []).map((m) => ({ role: m.role, content: String(m.content) }));
     const artifacts = [];
+    const queryLog = []; // every query_data this reply: {sql, columns, rows} — compose_report references these
     let lastRows = [], lastSql = "", replyText = "";
 
     for (let hop = 0; hop < 8; hop++) {
@@ -520,7 +547,29 @@ app.post("/api/chat", async (req, res) => {
         try {
           if (tu.name === "query_data") {
             lastSql = tu.input.sql; lastRows = await cubeSql(lastSql);
-            out = { rowCount: lastRows.length, columns: lastRows[0] ? Object.keys(lastRows[0]) : [], rows: lastRows.slice(0, 60) };
+            queryLog.push({ sql: lastSql, columns: lastRows[0] ? Object.keys(lastRows[0]) : [], rows: lastRows });
+            out = { queryIndex: queryLog.length, rowCount: lastRows.length, columns: lastRows[0] ? Object.keys(lastRows[0]) : [], rows: lastRows.slice(0, 60) };
+          } else if (tu.name === "compose_report") {
+            const secs = Array.isArray(tu.input.sections) ? tu.input.sections : [];
+            const parts = [], rendered = [];
+            for (const s of secs) {
+              const q = queryLog[(Number(s.queryIndex) || 0) - 1];
+              if (!q || !q.rows.length) continue;
+              const chart = s.chartType !== "table" && s.x && s.y && q.columns.includes(s.x) && q.columns.includes(s.y)
+                ? { type: s.chartType, x: s.x, y: s.y } : null;
+              parts.push({ title: s.title || "", note: s.note || "", sql: q.sql, chart });
+              rendered.push({ title: s.title || "", note: s.note || "", chart, columns: q.columns, rows: q.rows });
+            }
+            if (!parts.length) { out = { error: "No valid sections; check queryIndex values." }; }
+            else {
+              const list = loadReports();
+              let id = slug(tu.input.name || "report"); while (list.some((r) => r.id === id)) id += "-2";
+              const rep = { id, name: tu.input.name || "Report", description: tu.input.description || "", parts, updatedAt: new Date().toISOString() };
+              list.push(rep); saveReports(list);
+              renderedReports.set(id, renderReportParts({ report: rep, parts: rendered, meta: cubeManifest() }));
+              artifacts.push({ title: rep.name, chartType: "report", sections: rendered.map((p) => ({ title: p.title, rows: p.rows.length })), reportId: id, saveable: false });
+              out = { saved: true, reportId: id, sections: parts.length };
+            }
           } else if (tu.name === "present") {
             const columns = lastRows[0] ? Object.keys(lastRows[0]) : [];
             const rep = { name: tu.input.title, sql: lastSql, chart: tu.input.chartType === "table" ? null : { type: tu.input.chartType, x: tu.input.x, y: tu.input.y } };
