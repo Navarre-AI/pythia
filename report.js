@@ -8,10 +8,15 @@ const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").
 const MONEY = /amount|revenue|cost|margin|due|billed|total|price|value|retail|deal|outstanding/i;
 const isNum = (v) => typeof v === "number" || (v !== "" && v != null && !isNaN(Number(v)) && /^-?[\d.]+$/.test(String(v)));
 
+// Years are labels, not quantities: 2026, never "2,026".
+const isYearCol = (c) => /(^|[^a-z])(year|yr)($|[^a-z])/i.test(String(c || ""));
+const isYearVal = (n) => Number.isInteger(n) && n >= 1000 && n <= 9999;
+
 function fmt(col, v) {
   if (v == null || v === "") return "";
   if (isNum(v)) {
     const n = Number(v);
+    if (isYearCol(col) && isYearVal(n)) return String(n);
     if (MONEY.test(col) && !/pct|percent|rank|count|units|invoices|customers/i.test(col))
       return "$" + n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     if (/pct|percent/i.test(col)) return n.toLocaleString() + "%";
@@ -65,7 +70,7 @@ function chartSVG(chart, columns, rows) {
 // percentages, per-unit prices). One row -> show the values as-is.
 function kpiStrip(columns, rows) {
   const skip = /rank|running|\bavg|average|pct|percent|_value$|price|retail|\bid$/i;
-  const numCols = columns.filter((c) => rows.some((r) => isNum(r[c])) && (rows.length === 1 || !skip.test(c)));
+  const numCols = columns.filter((c) => rows.some((r) => isNum(r[c])) && !isYearCol(c) && (rows.length === 1 || !skip.test(c)));
   if (!numCols.length) return "";
   const items = numCols.slice(0, 4).map((c) => {
     const vals = rows.map((r) => Number(r[c])).filter((n) => !isNaN(n));
