@@ -63,6 +63,9 @@ async function ask(q, { def = "", required = false, secret = false } = {}) {
     process.stdout.write(`${q}${suffix}: `);
     const answer = await nextLine();
     if (answer === CLOSED) {
+      // Non-interactive (piped/EOF): optional questions fall back to their
+      // default; only a truly required missing answer is fatal.
+      if (!required) { console.log(def ? `(auto) ${def}` : "(auto: default)"); return def; }
       console.log("\nInput ended before setup finished. Re-run interactively, or pass flags (npm run setup -- --help).");
       process.exit(1);
     }
