@@ -21,12 +21,17 @@ fs.mkdirSync(CUBE_DIR, { recursive: true });
 
 const q = (id) => `"${String(id).replace(/"/g, '""')}"`; // quote a SQL identifier
 
-// Run SQL against the cube, JSON rows back. Read-only unless allowWrite.
-export function sql(query, { allowWrite = false } = {}) {
+// Each sql() shells out to a fresh duckdb process. A write process holds an
+// EXCLUSIVE lock on the file that blocks any concurrent reader ("Conflicting
+// lock" error) — e.g. a status/overview read landing during a multi-table sync.
+// Serialize all invocations through one in-process queue so, on a single
+// instance, two duckdb processes never touch the file at once; plus a short
+// retry to cover the brief post-exit window and any out-of-band writer.
+let dbQueue = Promise.resolve();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function runDuckDB(query, allowWrite) {
   return new Promise((resolve, reject) => {
-    if (!allowWrite && !/^\s*(select|with|pragma|describe|summarize)\b/i.test(query)) {
-      return reject(new Error("Only SELECT/WITH queries are allowed here."));
-    }
     // Read path runs in -safe mode: no filesystem reads, no getenv, no extension
     // installs — model-written SQL can't touch anything but the cube itself.
     // (The write path needs read_json for sync loads, so it stays unrestricted.)
@@ -37,6 +42,25 @@ export function sql(query, { allowWrite = false } = {}) {
       catch (e) { reject(new Error("Bad DuckDB output: " + e.message)); }
     });
   });
+}
+
+// Run SQL against the cube, JSON rows back. Read-only unless allowWrite.
+export function sql(query, { allowWrite = false } = {}) {
+  if (!allowWrite && !/^\s*(select|with|pragma|describe|summarize)\b/i.test(query)) {
+    return Promise.reject(new Error("Only SELECT/WITH queries are allowed here."));
+  }
+  const attempt = async () => {
+    for (let i = 0; ; i++) {
+      try { return await runDuckDB(query, allowWrite); }
+      catch (e) {
+        if (i < 40 && /conflicting lock|set lock/i.test(String(e.message))) { await sleep(250); continue; }
+        throw e;
+      }
+    }
+  };
+  const result = dbQueue.then(attempt, attempt); // serialize regardless of prior outcome
+  dbQueue = result.then(() => {}, () => {});      // keep the queue alive
+  return result;
 }
 
 // Sync one base table. Incremental when possible: if the table has a primary
