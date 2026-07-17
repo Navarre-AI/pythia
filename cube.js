@@ -171,6 +171,8 @@ export function cubeExists() {
 const SAMPLE_DIR = path.join(__dirname, "sample-data");
 
 export function sampleAvailable() {
+  // Client/production installs can turn the bundled demo data off entirely.
+  if (process.env.LOAD_SAMPLE === "0" || process.env.LOAD_SAMPLE === "false") return false;
   try { return fs.readdirSync(SAMPLE_DIR).some((f) => f.endsWith(".json")); } catch { return false; }
 }
 
