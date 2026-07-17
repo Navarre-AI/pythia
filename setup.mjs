@@ -20,6 +20,7 @@ Flags (all optional; anything missing is asked interactively):
   --local                 run locally instead of deploying to Fly
   --fly-token <token>     Fly API token (else uses your fly login / prompts ONCE)
   --app <name>            Fly app name (yours, globally unique)
+  --org <slug>            Fly org (interactive runs let fly ask; non-interactive defaults to personal)
   --region <code>         Fly region (e.g. iad, ams, syd)
   --anthropic-key <key>   Anthropic API key
   --site-password <pw>    site password (omit to auto-generate)
@@ -187,7 +188,8 @@ if (local) {
   say(`\n✓ Wrote fly.toml for app "${appName}" (${region})`);
 
   say(`\nCreating the app…`);
-  if (fly(["apps", "create", appName]).status !== 0) { say(`\nCouldn't create "${appName}" (name taken, or not logged in). Re-run setup with a different name.`); process.exit(1); }
+  const org = args.org || (process.stdin.isTTY ? "" : "personal"); // interactive: fly asks if needed
+  if (fly(["apps", "create", appName, ...(org ? ["--org", org] : [])]).status !== 0) { say(`\nCouldn't create "${appName}" (name taken, or not logged in). Re-run setup with a different name.`); process.exit(1); }
 
   say("Creating the data volume…");
   if (fly(["volumes", "create", "pythia_data", "--app", appName, "--region", region, "--size", "1", "--yes"]).status !== 0) process.exit(1);
