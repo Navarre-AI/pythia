@@ -306,7 +306,7 @@ app.get("/api/config", (_req, res) => {
   // AI config for the Settings panel: current model/speed/thinking + whether a
   // key is set (NEVER the key itself). keyIsCustom = a key was saved in-app.
   res.json({ includeTables: c.includeTables || [], displayNames: getDisplayNames(), savedAt: c.savedAt || null,
-    ai: { model: aiModel(), speed: aiSpeed(), thinking: aiThinking(), hasKey: Boolean(aiKey()), keyIsCustom: Boolean(c.aiKey) } });
+    ai: { model: aiModel(), speed: aiSpeed(), thinking: aiThinking(), hasKey: Boolean(aiKey()), keyIsCustom: Boolean(c.aiKey), keyPreview: ((k) => k ? k.slice(0, 8) + "…" + k.slice(-4) : "")(aiKey()) } });
 });
 
 // Lightweight base-table list for the settings panel (names + row counts only,
@@ -398,26 +398,7 @@ app.get("/api/cube/sync/stream", async (req, res) => {
   }
 });
 
-// Browse shadowed data: table list, or rows of one table.
-app.get("/api/cube/tables", async (_req, res) => {
-  try {
-    const t = await cubeSql(
-      "SELECT table_name AS name, estimated_size AS rows FROM duckdb_tables() ORDER BY table_name"
-    );
-    res.json(t);
-  } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
-});
-
-app.get("/api/cube/table/:name", async (req, res) => {
-  try {
-    const limit = Math.min(Number(req.query.limit) || 200, 2000);
-    const name = req.params.name.replace(/"/g, '""');
-    const rows = await cubeSql(`SELECT * FROM "${name}" LIMIT ${limit}`);
-    res.json({ name: req.params.name, rows });
-  } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
-});
-
-// Ad-hoc SELECT (data browser table peek uses /api/cube/table; this stays for tools).
+// Ad-hoc SELECT (used by internal tools).
 app.post("/api/query", async (req, res) => {
   try {
     const rows = await cubeSql(String(req.body?.sql || ""));

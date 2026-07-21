@@ -142,7 +142,6 @@
     </div>
     <div class="side-foot">
       <button class="footbtn" id="settingsBtn"><span>⚙</span> Settings &amp; tables</button>
-      <button class="footbtn" id="dataBtn"><span>▤</span> Browse data</button>
       <div id="dbFoot"></div>
     </div>
   </aside>
@@ -176,13 +175,6 @@
     </form>
   </main>
 
-  <div class="overlay" id="dataOverlay">
-    <div class="panel">
-      <div class="p-head"><strong id="dataTitle">Data</strong><span id="dataSub" style="color:var(--muted);font-size:12px"></span></div>
-      <div class="p-list" id="dataList"></div>
-      <div class="p-foot"><span class="sp"></span><button class="btn ghost" id="dataClose">Close</button></div>
-    </div>
-  </div>
 
   <div class="overlay" id="settingsOverlay">
     <div class="panel" style="width:min(720px,95vw)">
@@ -197,11 +189,11 @@
         <div class="set-sec">AI</div>
         <div class="set-row" style="flex-wrap:wrap;gap:12px">
           <label style="font-size:12.5px;color:var(--muted)">Model
-            <select id="aiModel" style="margin-left:4px;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:4px 6px;color:var(--ink);font:inherit;font-size:13px">
-              <option value="claude-fable-5">Fable 5 (default)</option>
-              <option value="claude-sonnet-5">Sonnet 5</option>
+            <select id="aiModel" onchange="syncFastEnabled()" style="margin-left:4px;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:4px 6px;color:var(--ink);font:inherit;font-size:13px">
+              <option value="claude-fable-5">Fable 5 (most capable, default)</option>
+              <option value="claude-opus-4-8">Opus 4.8</option>
+              <option value="claude-sonnet-5">Sonnet 5 (balanced)</option>
               <option value="claude-haiku-4-5-20251001">Haiku 4.5 (fastest)</option>
-              <option value="claude-opus-4-8">Opus 4.8 (most capable)</option>
             </select>
           </label>
           <label style="font-size:12.5px;color:var(--muted)">Thinking
@@ -211,7 +203,7 @@
               <option value="deep">Deep</option>
             </select>
           </label>
-          <label style="font-size:12.5px;color:var(--muted)"><input type="checkbox" id="aiFast" style="accent-color:var(--accent)"> Fast mode (Opus only)</label>
+          <label id="aiFastLabel" style="font-size:12.5px;color:var(--muted)"><input type="checkbox" id="aiFast" style="accent-color:var(--accent)"> Fast mode <span style="opacity:.7">(Opus 4.8 only)</span></label>
         </div>
         <div class="set-row" style="gap:8px">
           <input type="password" id="aiKey" placeholder="Anthropic API key (blank = keep current)" autocomplete="off" style="width:300px;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:5px 9px;color:var(--ink);font:inherit;font-size:13px">
@@ -582,7 +574,7 @@ async function openSettings() {
     ]);
     if (tbl.error) { $("setMsg").textContent = "Could not load tables: " + tbl.error; return; }
     displayNames = cfg.displayNames || displayNames;
-    if (cfg.ai) { $("aiModel").value = cfg.ai.model || "claude-fable-5"; $("aiThinking").value = cfg.ai.thinking || ""; $("aiFast").checked = cfg.ai.speed === "fast"; $("aiKey").value = ""; $("aiKeyStatus").textContent = cfg.ai.hasKey ? (cfg.ai.keyIsCustom ? "key set (in-app)" : "key set (env)") : "no key set"; }
+    if (cfg.ai) { $("aiModel").value = cfg.ai.model || "claude-fable-5"; $("aiThinking").value = cfg.ai.thinking || ""; $("aiFast").checked = cfg.ai.speed === "fast"; $("aiKey").value = ""; $("aiKeyStatus").textContent = cfg.ai.hasKey ? ((cfg.ai.keyPreview || "key") + (cfg.ai.keyIsCustom ? " (in-app)" : " (env)")) : "no key set"; syncFastEnabled(); }
     $("syncStatus").textContent = status.syncedAt ? ("last synced " + new Date(status.syncedAt).toLocaleString()) : "not synced yet";
     const synced = new Set((status.tables||[]).map(t=>t.name));
     const included = new Set(cfg.includeTables && cfg.includeTables.length ? cfg.includeTables : [...synced]);
@@ -619,6 +611,7 @@ function checkedTables() { return [...$("tableList").querySelectorAll("input[typ
 function editedNames() { const m={}; $("tableList").querySelectorAll(".tname").forEach(i=>{ const v=i.value.trim(); if (v && v!==i.dataset.real) m[i.dataset.real]=v; }); return m; }
 
 $("syncBtn").onclick = () => { const inc = checkedTables(); if (!inc.length) { $("setMsg").textContent = "Pick at least one table."; return; } runSync(inc); };
+function syncFastEnabled(){ const opus = $("aiModel").value === "claude-opus-4-8"; const f = $("aiFast"); f.disabled = !opus; if (!opus) f.checked = false; const lbl = $("aiFastLabel"); if (lbl) lbl.style.opacity = opus ? "1" : ".45"; }
 $("aiSaveBtn").onclick = async () => {
   const btn = $("aiSaveBtn"), old = btn.textContent; btn.disabled = true; btn.textContent = "Saving…";
   const ai = { model: $("aiModel").value, thinking: $("aiThinking").value, speed: $("aiFast").checked ? "fast" : "" };
@@ -692,24 +685,6 @@ $("resetBtn").onclick = async () => {
   $("settingsOverlay").classList.remove("open");
   conversationId = null; await loadConfigState(); loadReports(); loadConvos(); loadDb(); resetChat();
 };
-
-// ---- Data browser (friendly names, no SQL) ----
-$("dataBtn").onclick = async () => {
-  const st = await (await fetch(api("/api/cube/status"))).json();
-  $("dataSub").textContent = st.syncedAt ? "synced " + new Date(st.syncedAt).toLocaleString() : "not synced";
-  const tbls = st.exists ? await (await fetch(api("/api/cube/tables"))).json() : [];
-  $("dataTitle").textContent = "Data";
-  $("dataList").innerHTML = tbls.length ? tbls.map((t)=>`<div class="p-row" data-t="${esc(t.name)}" style="cursor:pointer"><span>${esc(friendly(t.name))}</span><span class="sp"></span><span style="color:var(--muted)">${Number(t.rows).toLocaleString()} rows</span></div>`).join("") : '<p style="color:var(--muted)">No local copy yet. Open Settings to sync.</p>';
-  $("dataList").querySelectorAll(".p-row").forEach((row)=>row.onclick = async () => {
-    const name = row.dataset.t;
-    const d = await (await fetch(api("/api/cube/table/"+encodeURIComponent(name)+"?limit=200"))).json();
-    $("dataTitle").textContent = friendly(name); $("dataSub").textContent = d.rows.length + " rows (first 200)";
-    const wrap = el("div"); wrap.appendChild(fullTable({ rows: d.rows }));
-    $("dataList").innerHTML = ""; $("dataList").appendChild(wrap);
-  });
-  $("dataOverlay").classList.add("open");
-};
-$("dataClose").onclick = () => $("dataOverlay").classList.remove("open");
 
 // ---- This-conversation menu (top-right) ----
 const chatMenu = $("chatMenu");
