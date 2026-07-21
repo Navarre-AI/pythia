@@ -13,34 +13,44 @@ import { sql as cubeSql, buildCube, syncTables, reconcileCube, cubeManifest, cub
 import { renderReport, renderReportParts } from "./report.js";
 import { SEED_REPORTS } from "./reports.seed.js";
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-fable-5";
-// Latency knobs, both env-driven so each client instance can tune without a
-// code fork. On any failure with knobs applied, retry once with a plain
-// request rather than surfacing the error.
-// - ANTHROPIC_SPEED=fast — fast mode (research preview): same model, up to
-//   2.5x output tokens/sec at premium pricing. Opus 4.8/4.7 only; needs the
-//   beta flag AND speed as a top-level body param; separate rate limit (an
-//   org with no fast-mode quota 429s with "0 fast mode input tokens").
-// - ANTHROPIC_THINKING=off — send thinking:{type:"disabled"}. Matters on
-//   Sonnet 5, where OMITTING thinking runs adaptive thinking by default;
-//   disabling it is the "straight to output" mode. Rejected (400) on Fable 5,
-//   which is what the plain-request fallback catches.
-const ANTHROPIC_SPEED = process.env.ANTHROPIC_SPEED || "";
-const ANTHROPIC_THINKING = process.env.ANTHROPIC_THINKING || "";
+// AI config: env vars are the DEFAULTS; the Settings > AI panel overrides any
+// of them per-install (stored on the volume in config.json). Getters read the
+// config first, fall back to env — so a blank key field keeps the env key.
+//   key      — ANTHROPIC_API_KEY / config.aiKey
+//   model    — claude-fable-5 | -sonnet-5 | -haiku-... | -opus-4-8
+//   speed    — "fast": fast mode (Opus-only, ~2.5x tok/s, premium, separate
+//              quota; needs the beta flag + top-level speed param).
+//   thinking — "off" (thinking:disabled, straight-to-output; matters on Sonnet),
+//              "deep" (extended thinking with a budget), or "" (adaptive default).
+// On any failure with a knob applied, retry once with a plain request.
+const ENV_KEY = process.env.ANTHROPIC_API_KEY || "";
+const ENV_MODEL = process.env.ANTHROPIC_MODEL || "claude-fable-5";
+const ENV_SPEED = process.env.ANTHROPIC_SPEED || "";
+const ENV_THINKING = process.env.ANTHROPIC_THINKING || "";
+const aiKey = () => readConfig().aiKey || ENV_KEY;
+const aiModel = () => readConfig().aiModel || ENV_MODEL;
+const aiSpeed = () => { const c = readConfig(); return c.aiSpeed !== undefined ? c.aiSpeed : ENV_SPEED; };
+const aiThinking = () => { const c = readConfig(); return c.aiThinking !== undefined ? c.aiThinking : ENV_THINKING; };
+// Snapshot taken ONCE at the start of a task, so a mid-task Settings change can't
+// switch model/params mid-loop. Pass it through every call in a multi-call flow.
+const aiSnapshot = () => ({ key: aiKey(), model: aiModel(), speed: aiSpeed(), thinking: aiThinking() });
 
-async function anthropicFetch(body, timeoutMs) {
-  const fast = ANTHROPIC_SPEED === "fast";
-  const noThink = ANTHROPIC_THINKING === "off";
-  const plainHeaders = { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" };
+async function anthropicFetch(body, timeoutMs, ai) {
+  const a = ai || aiSnapshot();
+  const fast = a.speed === "fast";
+  const think = a.thinking; // "off" | "deep" | ""
+  const plainHeaders = { "x-api-key": a.key, "anthropic-version": "2023-06-01", "content-type": "application/json" };
+  const thinkBody = think === "off" ? { thinking: { type: "disabled" } }
+    : think === "deep" ? { thinking: { type: "enabled", budget_tokens: 6000 }, max_tokens: Math.max(body.max_tokens || 2000, 8000) }
+    : {};
   const post = (headers, b) => fetch("https://api.anthropic.com/v1/messages", {
     method: "POST", headers, body: JSON.stringify(b), signal: AbortSignal.timeout(timeoutMs),
   });
   let res = await post(
     { ...plainHeaders, ...(fast ? { "anthropic-beta": "fast-mode-2026-02-01" } : {}) },
-    { ...body, ...(fast ? { speed: "fast" } : {}), ...(noThink ? { thinking: { type: "disabled" } } : {}) }
+    { ...body, ...(fast ? { speed: "fast" } : {}), ...thinkBody }
   );
-  if (!res.ok && (fast || noThink)) res = await post(plainHeaders, body);
+  if (!res.ok && (fast || think)) res = await post(plainHeaders, body);
   if (!res.ok) throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 200)}`);
   return res.json();
 }
@@ -105,12 +115,13 @@ app.get("/api/health", (_req, res) => {
 
 const RELEVANCE_PATH = path.join(DATA_DIR, "relevance.json");
 
-async function callAnthropic(system, user, maxTokens = 2000) {
+async function callAnthropic(system, user, maxTokens = 2000, ai) {
+  const a = ai || aiSnapshot();
   // A 38-table ranking reply can exceed 60s to generate; 60s here silently
   // degraded the whole pass to heuristic (no display names, no homing).
   const json = await anthropicFetch(
-    { model: ANTHROPIC_MODEL, max_tokens: maxTokens, system, messages: [{ role: "user", content: user }] },
-    180000
+    { model: a.model, max_tokens: maxTokens, system, messages: [{ role: "user", content: user }] },
+    180000, a
   );
   return json.content.map((c) => c.text || "").join("");
 }
@@ -175,7 +186,7 @@ async function getRelevance(schema, stats, { light = false } = {}) {
     if (cached.version === schema.version && !(cached.basis === "light" && !light)) return cached;
   } catch { /* no cache yet */ }
   let ranking, source;
-  if (ANTHROPIC_API_KEY) {
+  if (aiKey()) {
     try { ranking = await aiRelevance(schema.tables, stats); source = "ai"; }
     catch (e) { ranking = heuristicRelevance(schema.tables, stats); source = "heuristic (AI failed: " + String(e.message).slice(0, 80) + ")"; }
   } else {
@@ -292,7 +303,10 @@ app.get("/api/schema", async (req, res) => {
 
 app.get("/api/config", (_req, res) => {
   const c = readConfig();
-  res.json({ includeTables: c.includeTables || [], displayNames: getDisplayNames(), savedAt: c.savedAt || null });
+  // AI config for the Settings panel: current model/speed/thinking + whether a
+  // key is set (NEVER the key itself). keyIsCustom = a key was saved in-app.
+  res.json({ includeTables: c.includeTables || [], displayNames: getDisplayNames(), savedAt: c.savedAt || null,
+    ai: { model: aiModel(), speed: aiSpeed(), thinking: aiThinking(), hasKey: Boolean(aiKey()), keyIsCustom: Boolean(c.aiKey) } });
 });
 
 // Lightweight base-table list for the settings panel (names + row counts only,
@@ -321,9 +335,16 @@ app.post("/api/config", async (req, res) => {
   const config = readConfig();
   if (Array.isArray(req.body?.includeTables)) config.includeTables = req.body.includeTables;
   if (req.body?.displayNames && typeof req.body.displayNames === "object") config.displayNames = { ...(config.displayNames || {}), ...req.body.displayNames };
+  const ai = req.body?.ai;
+  if (ai && typeof ai === "object") {
+    if (typeof ai.aiKey === "string" && ai.aiKey.trim()) config.aiKey = ai.aiKey.trim(); // blank => keep current key
+    if (typeof ai.model === "string") config.aiModel = ai.model;
+    if (typeof ai.speed === "string") config.aiSpeed = ai.speed;
+    if (typeof ai.thinking === "string") config.aiThinking = ai.thinking;
+  }
   config.savedAt = new Date().toISOString();
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
-  res.json({ saved: config });
+  res.json({ saved: true }); // never echo the config back (holds the key)
 });
 
 // --- The cube (local SQL copy) ---------------------------------------------
@@ -585,8 +606,9 @@ app.delete("/api/conversations/:id", (req, res) => { try { fs.unlinkSync(convoPa
 // Two tools: query_data (SELECT) and present (turn the last result into a chart
 // or table the UI renders). Numbers come straight from the query rows.
 
-async function callAnthropicTools(system, messages, tools, maxTokens = 1500) {
-  return anthropicFetch({ model: ANTHROPIC_MODEL, max_tokens: maxTokens, system, tools, messages }, 60000);
+async function callAnthropicTools(system, messages, tools, maxTokens = 1500, ai) {
+  const a = ai || aiSnapshot();
+  return anthropicFetch({ model: a.model, max_tokens: maxTokens, system, tools, messages }, 60000, a);
 }
 
 async function cubeSchemaText() {
@@ -628,7 +650,7 @@ const CHAT_TOOLS = [
 
 app.post("/api/chat", async (req, res) => {
   try {
-    if (!ANTHROPIC_API_KEY) return res.json({ reply: "The AI key isn't set yet, so I can't answer questions. Set ANTHROPIC_API_KEY.", artifacts: [] });
+    if (!aiKey()) return res.json({ reply: "The AI key isn't set yet, so I can't answer questions. Set ANTHROPIC_API_KEY.", artifacts: [] });
     await ensureData();
     const schema = await cubeSchemaOrNull();
     if (!schema) return res.json({ reply: NEEDS_SETUP_MSG, artifacts: [] });
@@ -649,9 +671,10 @@ app.post("/api/chat", async (req, res) => {
     const artifacts = [];
     const queryLog = []; // every query_data this reply: {sql, columns, rows} — compose_report references these
     let lastRows = [], lastSql = "", replyText = "";
+    const ai = aiSnapshot(); // one model/speed/thinking snapshot for the whole turn
 
     for (let hop = 0; hop < 8; hop++) {
-      const resp = await callAnthropicTools(system, messages, CHAT_TOOLS);
+      const resp = await callAnthropicTools(system, messages, CHAT_TOOLS, 1500, ai);
       messages.push({ role: "assistant", content: resp.content });
       const toolUses = resp.content.filter((b) => b.type === "tool_use");
       replyText = resp.content.filter((b) => b.type === "text").map((b) => b.text).join(" ").trim() || replyText;
@@ -733,7 +756,7 @@ async function overviewSpec(schema) {
     const cached = JSON.parse(fs.readFileSync(OVERVIEW_PATH, "utf8"));
     if (cached.schema === schema && cached.spec) return cached.spec;
   } catch { /* no cache yet */ }
-  if (!ANTHROPIC_API_KEY) throw new Error("No AI key set, so the overview can't be designed yet.");
+  if (!aiKey()) throw new Error("No AI key set, so the overview can't be designed yet.");
   const dn = getDisplayNames();
   const system =
     "You design a landing dashboard for a database. Given the DuckDB tables below, propose the overview its owner would want to see first: " +
@@ -783,7 +806,7 @@ app.get("/api/overview", async (req, res) => {
 // AI "what stands out" — separate so the dashboard renders instantly and the
 // insights fill in when the model returns.
 app.post("/api/overview/insights", async (req, res) => {
-  if (!ANTHROPIC_API_KEY) return res.json({ insights: [] });
+  if (!aiKey()) return res.json({ insights: [] });
   try {
     const txt = await callAnthropic(
       "You are a sharp data analyst. Given these dashboard figures, write 3 short, specific, punchy insights the data's owner would act on. One sentence each, no preamble. Return ONLY a JSON array of strings.",
@@ -795,7 +818,7 @@ app.post("/api/overview/insights", async (req, res) => {
 // Suggested next questions — fuel the manager's drill-down. Loaded async after
 // an answer so it never slows the reply.
 app.post("/api/followups", async (req, res) => {
-  if (!ANTHROPIC_API_KEY) return res.json({ followups: [] });
+  if (!aiKey()) return res.json({ followups: [] });
   try {
     const txt = await callAnthropic(
       "You suggest what the user would naturally ask NEXT about their data. Given their question and the answer, propose 3 short natural-language follow-up questions (max 7 words each) that drill deeper or pivot usefully, answerable from the same data. Return ONLY a JSON array of 3 strings.",
@@ -820,7 +843,7 @@ app.post("/api/reset", (_req, res) => {
 // manager would want, validate each SQL by running it, keep the ones that work.
 app.post("/api/reports/generate", async (req, res) => {
   try {
-    if (!ANTHROPIC_API_KEY) return res.status(400).json({ error: "No AI key set." });
+    if (!aiKey()) return res.status(400).json({ error: "No AI key set." });
     await ensureData();
     const schema = await cubeSchemaText();
     const dn = getDisplayNames();
