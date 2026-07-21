@@ -48,6 +48,8 @@
     .msg { max-width:86%; padding:11px 15px; border-radius:14px; white-space:pre-wrap; word-wrap:break-word; }
     .user { align-self:flex-end; background:var(--accent); color:#fff; }
     .bot { align-self:flex-start; background:var(--panel); border:1px solid var(--line); box-shadow:var(--shadow); }
+    .bot ul, .bot ol { margin:6px 0; padding-left:22px; } .bot li { margin:2px 0; }
+    .bot .mdh { font-weight:600; margin:6px 0 2px; } .bot code { background:var(--panel2); padding:1px 5px; border-radius:5px; font-size:.9em; }
     .meta { align-self:center; color:var(--muted); font-size:12px; }
     .stamp { align-self:flex-end; color:var(--dim); font-size:11px; margin:2px 2px -6px 0; }
     .chips { align-self:flex-start; display:flex; flex-wrap:wrap; gap:8px; margin-top:2px; }
@@ -243,7 +245,22 @@ const fmtN = (v, col) => typeof v === "number" ? (isYearCol(col) && isYearVal(v)
 const GREETING = "Ask me anything about your data in plain English — I answer with real numbers and charts, no SQL, no spreadsheets. Try one of these:";
 const STARTERS = ["What's in this data?", "What are the trends over time?", "What are the biggest categories?", "What stands out?", "Anything that needs attention?"];
 
-function add(role, text) { const e = el("div", "msg " + (role === "user" ? "user" : "bot")); e.textContent = text; log.appendChild(e); scrollBottom(); return e; }
+// Lightweight, SAFE markdown for the assistant's replies (escape first, then
+// format) so **bold**, `code`, bullets, and numbered lists render instead of
+// showing raw. User messages stay plain text.
+function mdInline(s) { return s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/`([^`]+)`/g, "<code>$1</code>"); }
+function renderMd(text) {
+  const lines = String(text).split("\n"); let html = "", inList = false, tag = "";
+  const close = () => { if (inList) { html += `</${tag}>`; inList = false; } };
+  for (const raw of lines) {
+    const line = esc(raw);
+    const b = line.match(/^\s*[-*]\s+(.*)/), n = line.match(/^\s*\d+\.\s+(.*)/);
+    if (b || n) { const t = n ? "ol" : "ul"; if (!inList) { html += `<${t}>`; inList = true; tag = t; } else if (tag !== t) { html += `</${tag}><${t}>`; tag = t; } html += `<li>${mdInline((b || n)[1])}</li>`; }
+    else { close(); const h = line.match(/^\s*#{1,6}\s+(.*)/); if (h) html += `<div class="mdh">${mdInline(h[1])}</div>`; else if (line.trim() === "") html += "<br>"; else html += `<div>${mdInline(line)}</div>`; }
+  }
+  close(); return html;
+}
+function add(role, text) { const e = el("div", "msg " + (role === "user" ? "user" : "bot")); if (role === "user") e.textContent = text; else e.innerHTML = renderMd(text); log.appendChild(e); scrollBottom(); return e; }
 function metaLine(text) { const e = el("div", "meta"); e.textContent = text; log.appendChild(e); scrollBottom(); return e; }
 
 function barChart(rows) {
@@ -283,8 +300,8 @@ function fullTable(a) {
   const cols = a.columns || (a.rows[0] ? Object.keys(a.rows[0]) : []);
   const wrap = el("div", "tbl-scroll");
   const t = el("table", "tbl");
-  t.innerHTML = "<tr>" + cols.map((c)=>`<th>${c}</th>`).join("") + "</tr>" +
-    a.rows.map((r)=>"<tr>"+cols.map((c)=>{const v=r[c];const num=typeof v==="number";return `<td class="${num?"n":""}">${num?fmtN(v,c):(v??"")}</td>`}).join("")+"</tr>").join("");
+  t.innerHTML = "<tr>" + cols.map((c)=>`<th>${esc(c)}</th>`).join("") + "</tr>" +
+    a.rows.map((r)=>"<tr>"+cols.map((c)=>{const v=r[c];const num=typeof v==="number";return `<td class="${num?"n":""}">${num?esc(fmtN(v,c)):esc(v??"")}</td>`}).join("")+"</tr>").join("");
   wrap.appendChild(t); return wrap;
 }
 function artifactCard(a) {
