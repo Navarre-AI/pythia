@@ -91,7 +91,7 @@ async function syncTable(table, { onProgress, watermark } = {}) {
   // safely in the past, strict `gt` — otherwise a bulk import that stamped
   // thousands of rows in one second gets re-pulled on every sync forever.
   const wmOp = watermark && Date.now() - Date.parse(watermark) > 5 * 60 * 1000 ? "gt" : "ge";
-  const rows = await fetchAllRows(table.occurrences[0], names, { onProgress, filter: incremental ? `${modField} ${wmOp} ${watermark}` : undefined });
+  const rows = await fetchAllRows(table.occurrences[0], names, { db: table.db, onProgress, filter: incremental ? `${modField} ${wmOp} ${watermark}` : undefined });
   const newWatermark = modField ? rows.reduce((mx, r) => (r[modField] && r[modField] > mx ? r[modField] : mx), watermark || "") : null;
 
   const file = path.join(CUBE_DIR, `${name}.json`);
@@ -115,7 +115,7 @@ async function syncTable(table, { onProgress, watermark } = {}) {
     await sql(load, { allowWrite: true });
   }
   const total = (await sql(`SELECT count(*) c FROM ${q(name)}`))[0]?.c ?? rows.length;
-  return { name, rows: total, changed: rows.length, mode: incremental ? "incremental" : "full", watermark: newWatermark, columns: names };
+  return { name, db: table.db, rows: total, changed: rows.length, mode: incremental ? "incremental" : "full", watermark: newWatermark, columns: names };
 }
 
 // Sync a specific set of base tables into the existing cube (create-or-replace

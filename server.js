@@ -1,20 +1,49 @@
 // Pythia: general-purpose conversational reporting for FileMaker databases.
 // Ask in plain English; answers come from a local DuckDB copy of the connected
 // database (synced over OData), with the AI choosing queries and the server
-// injecting real rows — zero hallucination on data. See README.md and RULES.md.
+// injecting the real rows, not model-written numbers. See README.md and RULES.md.
 
 import "./env.js";
 import express from "express";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { fmConfigured, fetchSchema, fetchCounts, layoutStats } from "./fm.js";
+import { fmConfigured, fetchSchema, fetchCounts, layoutStats, baseName } from "./fm.js";
 import { sql as cubeSql, buildCube, syncTables, reconcileCube, cubeManifest, cubeExists, sampleAvailable, loadSampleData } from "./cube.js";
 import { renderReport, renderReportParts } from "./report.js";
 import { SEED_REPORTS } from "./reports.seed.js";
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-fable-5";
+// Latency knobs, both env-driven so each client instance can tune without a
+// code fork. On any failure with knobs applied, retry once with a plain
+// request rather than surfacing the error.
+// - ANTHROPIC_SPEED=fast — fast mode (research preview): same model, up to
+//   2.5x output tokens/sec at premium pricing. Opus 4.8/4.7 only; needs the
+//   beta flag AND speed as a top-level body param; separate rate limit (an
+//   org with no fast-mode quota 429s with "0 fast mode input tokens").
+// - ANTHROPIC_THINKING=off — send thinking:{type:"disabled"}. Matters on
+//   Sonnet 5, where OMITTING thinking runs adaptive thinking by default;
+//   disabling it is the "straight to output" mode. Rejected (400) on Fable 5,
+//   which is what the plain-request fallback catches.
+const ANTHROPIC_SPEED = process.env.ANTHROPIC_SPEED || "";
+const ANTHROPIC_THINKING = process.env.ANTHROPIC_THINKING || "";
+
+async function anthropicFetch(body, timeoutMs) {
+  const fast = ANTHROPIC_SPEED === "fast";
+  const noThink = ANTHROPIC_THINKING === "off";
+  const plainHeaders = { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" };
+  const post = (headers, b) => fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST", headers, body: JSON.stringify(b), signal: AbortSignal.timeout(timeoutMs),
+  });
+  let res = await post(
+    { ...plainHeaders, ...(fast ? { "anthropic-beta": "fast-mode-2026-02-01" } : {}) },
+    { ...body, ...(fast ? { speed: "fast" } : {}), ...(noThink ? { thinking: { type: "disabled" } } : {}) }
+  );
+  if (!res.ok && (fast || noThink)) res = await post(plainHeaders, body);
+  if (!res.ok) throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  return res.json();
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -77,18 +106,12 @@ app.get("/api/health", (_req, res) => {
 const RELEVANCE_PATH = path.join(DATA_DIR, "relevance.json");
 
 async function callAnthropic(system, user, maxTokens = 2000) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: maxTokens, system, messages: [{ role: "user", content: user }] }),
-    signal: AbortSignal.timeout(60000),
-  });
-  if (!res.ok) throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  const json = await res.json();
+  // A 38-table ranking reply can exceed 60s to generate; 60s here silently
+  // degraded the whole pass to heuristic (no display names, no homing).
+  const json = await anthropicFetch(
+    { model: ANTHROPIC_MODEL, max_tokens: maxTokens, system, messages: [{ role: "user", content: user }] },
+    180000
+  );
   return json.content.map((c) => c.text || "").join("");
 }
 
@@ -97,18 +120,25 @@ function heuristicRelevance(tables, stats) {
   const REFERENCE = /category|note|review|phone|employee|join|type/i;
   return tables.map((t) => {
     const layouts = stats?.counts?.[t.name] ?? 0;
-    const rows = t.rowCount ?? 0;
+    const rows = t.rowCount; // null = count failed, NOT an empty table
     let tier = "reference";
-    if (SYSTEM.test(t.name) || rows <= 2 || (layouts === 0 && t.fields.length < 6)) tier = "system";
+    if (SYSTEM.test(t.name) || (rows != null && rows <= 2) || (layouts === 0 && t.fields.length < 6)) tier = "system";
     else if (layouts >= 3 || rows >= 500) tier = "core";
     else if (REFERENCE.test(t.name)) tier = "reference";
-    return { name: t.name, tier, include: tier !== "system", reason: `${layouts} layouts, ${rows.toLocaleString()} rows (heuristic)` };
+    return { name: t.name, tier, include: tier !== "system", reason: `${layouts} layouts, ${rows == null ? "?" : rows.toLocaleString()} rows (heuristic)` };
   });
 }
 
 async function aiRelevance(tables, stats) {
+  const multiFile = tables.some((t) => t.occByDb && Object.keys(t.occByDb).length > 1);
   const summary = tables.map((t) => ({
     name: t.name,
+    occurrences: (t.occurrences || []).slice(0, 8),
+    // OData cannot say which FILE a base table lives in (GOTCHAS.md), so give
+    // the model each candidate file with the TO names seen there and let it
+    // pick the home. Legacy multi-file solutions usually name files after
+    // their table, so this is strong signal.
+    ...(multiFile ? { candidateFiles: Object.fromEntries(Object.entries(t.occByDb || {}).map(([db, occs]) => [db, occs.slice(0, 4)])) } : {}),
     rows: t.rowCount ?? null,
     layouts: stats?.counts?.[t.name] ?? 0,
     fields: t.fields.slice(0, 14).map((f) => f.name),
@@ -122,16 +152,27 @@ async function aiRelevance(tables, stats) {
     "worth reporting: logs, dashboards, chart configs, field definitions, example data, join/selector " +
     "helper tables). Signals: many layouts referencing a table and higher row counts suggest importance; " +
     "developer field comments reveal intent. Set include=true for core and reference, false for system. " +
-    "Reply ONLY with a JSON array of {name, tier, include, reason} where reason is <=12 words.";
-  const text = await callAnthropic(system, "Tables:\n" + JSON.stringify(summary, null, 1));
+    "Each `name` is derived from the table's occurrence names and may be a cryptic prefixed fragment " +
+    "(P__Person, REP_ort, HEXP__Harvest Expense); also propose displayName, the clean human name of the " +
+    "underlying entity, inferred from the occurrence names, fields, and comments (e.g. \"Person\", " +
+    "\"Report\", \"Harvest Expense\"). Singular, title case, no prefixes. " +
+    "Reply ONLY with a JSON array of {name, displayName, tier, include, reason} where reason is <=12 words. " +
+    "Where a table has candidateFiles, ALSO set homeFile: the file the base table most likely LIVES in. " +
+    "Judge by file naming (a file named after the entity is its home; e.g. SubQuotes lives in 'New Quotes', " +
+    "not in a hub UI file like 'New Master' that references everything) and by TO naming per file. " +
+    "homeFile MUST be one of that table's candidateFiles keys. " +
+    "A row's rows:null means the count failed, not an empty table.";
+  const text = await callAnthropic(system, "Tables:\n" + JSON.stringify(summary, null, 1), 8192);
   const jsonStr = text.slice(text.indexOf("["), text.lastIndexOf("]") + 1);
   return JSON.parse(jsonStr);
 }
 
-async function getRelevance(schema, stats) {
+async function getRelevance(schema, stats, { light = false } = {}) {
   try {
     const cached = JSON.parse(fs.readFileSync(RELEVANCE_PATH, "utf8"));
-    if (cached.version === schema.version) return cached;
+    // A "light" ranking (no layout stats — computed for a fast Settings open)
+    // satisfies light callers, but /api/schema recomputes it with full stats.
+    if (cached.version === schema.version && !(cached.basis === "light" && !light)) return cached;
   } catch { /* no cache yet */ }
   let ranking, source;
   if (ANTHROPIC_API_KEY) {
@@ -141,20 +182,85 @@ async function getRelevance(schema, stats) {
     ranking = heuristicRelevance(schema.tables, stats);
     source = "heuristic (set ANTHROPIC_API_KEY for AI ranking)";
   }
-  const out = { version: schema.version, source, ranking, rankedAt: new Date().toISOString() };
+  const out = { version: schema.version, basis: light ? "light" : "full", source, ranking, rankedAt: new Date().toISOString() };
   try { fs.writeFileSync(RELEVANCE_PATH, JSON.stringify(out, null, 2)); } catch { /* read-only fs ok */ }
   return out;
+}
+
+// Re-home merged tables to their AI-proposed home file and re-derive the real
+// name from THAT file's occurrence names. OData can't tell us where a base
+// table lives (GOTCHAS.md), and the most-occurrences heuristic crowns the hub
+// UI file, so the ranking's homeFile — validated against the candidates we
+// actually saw — is the authority. Renames flow into ranking entries (rawName
+// preserved so a cached ranking still matches a fresh schema fetch) and edges.
+function rehomeAndRename(schema, relevance) {
+  const byName = new Map(schema.tables.map((t) => [t.name, t]));
+  const renames = new Map();
+  let entriesChanged = false;
+  const pairs = [];
+  for (const r of relevance.ranking || []) {
+    const t = byName.get(r.rawName ?? r.name) || byName.get(r.name);
+    if (!t) continue;
+    pairs.push([t, r]);
+    if (r.homeFile && t.occByDb?.[r.homeFile] && r.homeFile !== t.db) {
+      t.db = r.homeFile;
+      t.occurrences = t.occByDb[r.homeFile];
+      // Only a re-homed table gets a re-derived name: the home file's own TO
+      // names beat a name derived from 20 hub-file TOs. Un-moved tables keep
+      // their already-disambiguated name (re-deriving collapsed fmLog and
+      // AI_Log both to "Log" once).
+      const derived = baseName(t.occurrences);
+      if (derived && derived !== t.name) {
+        if (r.rawName === undefined) { r.rawName = r.name; entriesChanged = true; }
+        renames.set(t.name, derived);
+        byName.delete(t.name);
+        t.name = derived;
+        byName.set(t.name, t);
+      }
+    }
+    if (r.name !== t.name) { r.name = t.name; entriesChanged = true; }
+  }
+  // Guarantee global uniqueness: qualify with the home file, then the shortest
+  // occurrence name, then a counter. First claimant keeps the plain name.
+  const used = new Set();
+  const entryFor = new Map(pairs.map(([t, r]) => [t, r]));
+  for (const t of schema.tables) {
+    if (!used.has(t.name)) { used.add(t.name); continue; }
+    const shortest = t.occurrences.slice().sort((a, b) => a.length - b.length)[0];
+    let candidate = [`${t.name} (${t.db})`, shortest, `${shortest} (${t.db})`].find((c) => c && !used.has(c));
+    for (let i = 2; !candidate; i++) if (!used.has(`${t.name} ${i}`)) candidate = `${t.name} ${i}`;
+    renames.set(t.name, candidate);
+    const r = entryFor.get(t);
+    if (r) { if (r.rawName === undefined) { r.rawName = r.name; } r.name = candidate; entriesChanged = true; }
+    t.name = candidate;
+    used.add(t.name);
+  }
+  if (renames.size) for (const e of schema.edges || []) {
+    if (renames.has(e.from)) e.from = renames.get(e.from);
+    if (renames.has(e.to)) e.to = renames.get(e.to);
+  }
+  if (entriesChanged) { try { fs.writeFileSync(RELEVANCE_PATH, JSON.stringify(relevance, null, 2)); } catch { /* read-only fs ok */ } }
+  return schema;
 }
 
 // Schema (base tables, counts, per-table layout reference counts, AI relevance
 // ranking), cached in memory per boot. ?refresh=1 re-reads from the server and
 // re-ranks.
 let schemaCache = null;
+
+// Every consumer of table names (sync, chat, reports) must see the SAME homed
+// and renamed tables the Settings UI shows, or selections stop matching.
+async function rehomedSchema() {
+  if (schemaCache) return schemaCache;
+  const schema = await fetchSchema();
+  try { rehomeAndRename(schema, await getRelevance(schema, { counts: {} }, { light: true })); } catch { /* un-homed is still usable */ }
+  return schema;
+}
 app.get("/api/schema", async (req, res) => {
   try {
     if (!fmConfigured) return res.status(503).json({ error: "FM_* env not configured" });
     if (!schemaCache || req.query.refresh) {
-      const schema = await fetchSchema();
+      const schema = await fetchSchema(Boolean(req.query.refresh));
       const counts = await fetchCounts(schema.tables);
       for (const t of schema.tables) t.rowCount = counts[t.name] ?? null;
       let stats = { counts: {}, layoutsByTable: {}, aiLayouts: [], totalLayouts: null };
@@ -166,6 +272,8 @@ app.get("/api/schema", async (req, res) => {
       if (req.query.refresh) { try { fs.unlinkSync(RELEVANCE_PATH); } catch {} }
       const relevance = await getRelevance(schema, stats);
       schema.relevanceSource = relevance.source;
+      rehomeAndRename(schema, relevance);
+      tablesCache = null; // table names/homes may have changed
       const byName = Object.fromEntries(relevance.ranking.map((r) => [r.name, r]));
       for (const t of schema.tables) {
         const r = byName[t.name] || { tier: "reference", include: true, reason: "" };
@@ -194,9 +302,14 @@ app.get("/api/tables", async (_req, res) => {
   try {
     if (!fmConfigured) return res.status(503).json({ error: "FM_* env not configured" });
     if (!tablesCache || _req.query.refresh) {
-      const schema = await fetchSchema();
+      const schema = await fetchSchema(Boolean(_req.query.refresh));
       const counts = await fetchCounts(schema.tables);
-      tablesCache = { db: schema.db, tables: schema.tables.map((t) => ({ name: t.name, rowCount: counts[t.name] ?? null, fields: t.fields.length })) };
+      for (const t of schema.tables) t.rowCount = counts[t.name] ?? null; // attach BEFORE renames
+      // Apply AI homing + display naming so Settings shows tables under the
+      // file they live in. Uses the cached ranking when present; otherwise a
+      // "light" ranking (no layout stats) so the first Settings open works.
+      try { rehomeAndRename(schema, await getRelevance(schema, { counts: {} }, { light: true })); } catch { /* FM-only view is fine */ }
+      tablesCache = { db: schema.db, dbs: schema.dbs, dbErrors: schema.dbErrors || [], tables: schema.tables.map((t) => ({ name: t.name, db: t.db, rowCount: t.rowCount, fields: t.fields.length })) };
     }
     res.json(tablesCache);
   } catch (e) { res.status(502).json({ error: String(e.message || e) }); }
@@ -223,7 +336,7 @@ app.get("/api/cube/status", (_req, res) => {
 app.post("/api/cube/sync", async (req, res) => {
   try {
     if (!fmConfigured) return res.status(503).json({ error: "FM_* env not configured" });
-    const schema = schemaCache || (await fetchSchema());
+    const schema = await rehomedSchema();
     let include = req.body?.tables;
     if (!Array.isArray(include)) {
       try { include = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")).includeTables; } catch { include = []; }
@@ -246,7 +359,7 @@ app.get("/api/cube/sync/stream", async (req, res) => {
   const send = (evt) => { res.write(`data: ${JSON.stringify(evt)}\n\n`); };
   try {
     if (!fmConfigured) { send({ type: "error", message: "FileMaker not configured" }); return res.end(); }
-    const schema = schemaCache || (await fetchSchema());
+    const schema = await rehomedSchema();
     let include = req.query.tables ? String(req.query.tables).split(",").filter(Boolean) : configuredTables();
     if (!include.length) { send({ type: "error", message: "No tables selected" }); return res.end(); }
     // Attach expected row counts (from the tables cache) to the plan event.
@@ -301,10 +414,19 @@ app.post("/api/query", async (req, res) => {
 // schema (Settings pre-checks the AI relevance-ranked tables). Empty until set.
 function readConfig() { try { return JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8")); } catch { return {}; } }
 function configuredTables() { const c = readConfig(); return c.includeTables && c.includeTables.length ? c.includeTables : []; }
-function getDisplayNames() { return { ...(readConfig().displayNames || {}) }; }
+// Friendly names: AI-proposed displayNames (from the cached relevance ranking)
+// underneath, the user's own renames on top.
+function getDisplayNames() {
+  const proposed = {};
+  try {
+    for (const r of JSON.parse(fs.readFileSync(RELEVANCE_PATH, "utf8")).ranking || [])
+      if (r.displayName && r.displayName !== r.name) proposed[r.name] = r.displayName;
+  } catch { /* no ranking cached yet */ }
+  return { ...proposed, ...(readConfig().displayNames || {}) };
+}
 
 async function syncConfigured() {
-  const schema = schemaCache || (await fetchSchema());
+  const schema = await rehomedSchema();
   await buildCube(schema.tables, configuredTables(), (m) => console.log("[sync]", m));
 }
 // Ensure the cube exists at all (build once if missing). Everything answers from
@@ -464,14 +586,7 @@ app.delete("/api/conversations/:id", (req, res) => { try { fs.unlinkSync(convoPa
 // or table the UI renders). Numbers come straight from the query rows.
 
 async function callAnthropicTools(system, messages, tools, maxTokens = 1500) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-    body: JSON.stringify({ model: ANTHROPIC_MODEL, max_tokens: maxTokens, system, tools, messages }),
-    signal: AbortSignal.timeout(60000),
-  });
-  if (!res.ok) throw new Error(`Anthropic ${res.status}: ${(await res.text()).slice(0, 200)}`);
-  return res.json();
+  return anthropicFetch({ model: ANTHROPIC_MODEL, max_tokens: maxTokens, system, tools, messages }, 60000);
 }
 
 async function cubeSchemaText() {
@@ -750,7 +865,7 @@ app.post("/api/notify", (req, res) => {
   res.json({ ok: true }); // fast ack; process out of band
   notifyChain = notifyChain.then(async () => {
     if (!fmConfigured) return;
-    const schema = schemaCache || (await fetchSchema());
+    const schema = await rehomedSchema();
     const included = new Set(configuredTables()); // only tables the user reports on
     const findTable = (name) => schema.tables.find((t) => t.name === name || t.occurrences.includes(name));
     const toSync = new Set(), deletes = [];

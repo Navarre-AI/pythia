@@ -84,12 +84,24 @@ function fly(argv, { capture = false } = {}) {
 }
 
 async function checkFm(host, db, user, pass) {
+  // With a db: check that file's $metadata. Blank db (auto-discover mode):
+  // check the OData service root, which lists the files this account can see.
+  const first = db ? db.split(",")[0].trim() : "";
+  const url = first
+    ? `https://${host}/fmi/odata/v4/${encodeURIComponent(first)}/$metadata`
+    : `https://${host}/fmi/odata/v4`;
   try {
-    const res = await fetch(`https://${host}/fmi/odata/v4/${encodeURIComponent(db)}/$metadata`, {
+    const res = await fetch(url, {
       headers: { Authorization: "Basic " + Buffer.from(`${user}:${pass}`).toString("base64"), Accept: "*/*" },
       signal: AbortSignal.timeout(15000),
     });
-    return res.ok ? null : `HTTP ${res.status} from the OData endpoint`;
+    if (!res.ok) return `HTTP ${res.status} from the OData endpoint`;
+    if (!first) {
+      const names = ((await res.json()).value || []).map((v) => v.name);
+      if (!names.length) return "Connected, but this account can't see any files over OData";
+      say(`  Files visible to this account: ${names.join(", ")}`);
+    }
+    return null;
   } catch (e) { return String(e.message || e); }
 }
 
@@ -153,7 +165,7 @@ if (!args["skip-fm"]) {
   if (wantFm.startsWith("y") || args["fm-host"]) {
     for (;;) {
       const host = args["fm-host"] || (await ask("  FileMaker Server host (e.g. fms.example.com)", { required: true }));
-      const db = args["fm-db"] || (await ask("  Database name (as it appears on the server)", { required: true }));
+      const db = args["fm-db"] ?? (await ask("  Database name(s), comma-separated (Enter = every file this account can see)", { def: "" }));
       const user = args["fm-user"] || (await ask("  Account name (read access + fmodata/fmrest privileges)", { required: true }));
       const pass = args["fm-pass"] || (await ask("  Account password", { required: true, secret: true }));
       say("  Checking the connection (OData $metadata)…");
@@ -175,7 +187,7 @@ if (local) {
     "# Written by setup.mjs (local dev configuration). Never commit this file.",
     anthropicKey ? `ANTHROPIC_API_KEY=${anthropicKey}` : "# ANTHROPIC_API_KEY=",
     `SITE_PASSWORD=${sitePassword}`,
-    ...(fm ? [`FM_HOST=${fm.host}`, `FM_DB="${fm.db}"`, `FM_USER=${fm.user}`, `FM_PASS=${fm.pass}`] : ["# FM_* unset: bundled sample data loads on first run"]),
+    ...(fm ? [`FM_HOST=${fm.host}`, ...(fm.db ? [`FM_DB="${fm.db}"`] : ["# FM_DB unset: auto-discover files"]), `FM_USER=${fm.user}`, `FM_PASS=${fm.pass}`] : ["# FM_* unset: bundled sample data loads on first run"]),
   ];
   fs.writeFileSync(path.join(__dirname, ".env"), lines.join("\n") + "\n");
   say("");
@@ -197,7 +209,7 @@ if (local) {
   say("Setting secrets…");
   const secrets = [`SITE_PASSWORD=${sitePassword}`];
   if (anthropicKey) secrets.push(`ANTHROPIC_API_KEY=${anthropicKey}`);
-  if (fm) secrets.push(`FM_HOST=${fm.host}`, `FM_DB=${fm.db}`, `FM_USER=${fm.user}`, `FM_PASS=${fm.pass}`);
+  if (fm) { secrets.push(`FM_HOST=${fm.host}`, `FM_USER=${fm.user}`, `FM_PASS=${fm.pass}`); if (fm.db) secrets.push(`FM_DB=${fm.db}`); }
   if (fly(["secrets", "set", "--app", appName, "--stage", ...secrets]).status !== 0) process.exit(1);
 
   say("Deploying (first build takes a few minutes)…");

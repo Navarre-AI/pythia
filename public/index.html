@@ -544,16 +544,31 @@ async function openSettings() {
     $("syncStatus").textContent = status.syncedAt ? ("last synced " + new Date(status.syncedAt).toLocaleString()) : "not synced yet";
     const synced = new Set((status.tables||[]).map(t=>t.name));
     const included = new Set(cfg.includeTables && cfg.includeTables.length ? cfg.includeTables : [...synced]);
-    $("setSub").textContent = tbl.db || "";
-    const tables = (tbl.tables||[]).slice().sort((a,b)=>(b.rowCount||0)-(a.rowCount||0));
+    const dbs = tbl.dbs && tbl.dbs.length ? tbl.dbs : (tbl.db ? [tbl.db] : []);
+    $("setSub").textContent = dbs.length > 1 ? dbs.length + " database files" : (tbl.db || "");
+    const tables = (tbl.tables||[]).slice().sort((a,b)=>friendly(a.name).localeCompare(friendly(b.name)));
     $("tableList").innerHTML = "";
-    for (const t of tables) {
+    const addRow = (t) => {
       const row = el("div","trow"); const on = synced.has(t.name);
       row.innerHTML = `<input type="checkbox" ${included.has(t.name)?"checked":""} data-t="${esc(t.name)}">`+
         `<input class="tname" value="${esc(friendly(t.name))}" data-real="${esc(t.name)}" title="friendly name">`+
         `<span class="treal">${esc(t.name)} · ${t.rowCount==null?"?":Number(t.rowCount).toLocaleString()} rows</span>`+
         `<span class="tbadge ${on?"on":"off"}">${on?"in local copy":"off"}</span>`;
       $("tableList").appendChild(row);
+    };
+    if (dbs.length > 1) {
+      // One section per database file, in server order.
+      for (const db of dbs) {
+        const mine = tables.filter((t)=>t.db===db);
+        if (!mine.length) continue;
+        const hd = el("div","set-sec"); hd.textContent = db;
+        $("tableList").appendChild(hd);
+        mine.forEach(addRow);
+      }
+      const err = (tbl.dbErrors||[]);
+      if (err.length) { const w = el("div","set-sec"); w.style.color="var(--muted)"; w.textContent = "Unreachable: " + err.map(e=>e.db).join(", "); $("tableList").appendChild(w); }
+    } else {
+      tables.forEach(addRow);
     }
     $("setMsg").textContent = "";
   } catch (e) { $("setMsg").textContent = "Error: " + (e.message || e); }

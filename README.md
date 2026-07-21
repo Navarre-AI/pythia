@@ -10,8 +10,8 @@ Sibling of [Hecate](https://github.com/Navarre-AI/hecate), the intake gatekeeper
 
 ## The two rules
 
-1. **FileMaker is the source of truth. Zero hallucination on data.**
-   The model never writes numbers into an answer or report. It chooses which query feeds which chart; the server runs the SQL and injects the real rows verbatim. A wrong number in a table or chart is impossible by construction.
+1. **FileMaker is the source of truth. The numbers come from your data, not the model.**
+   The model never writes numbers into an answer or report. It chooses which query feeds which chart; the server runs the SQL and injects the real rows verbatim.
 
 2. **You never see the plumbing.**
    No SQL, no table names, no UUIDs or internal keys ever reach the screen. Rows are identified by their human labels; answers are plain business English. (`RULES.md` is the living rulebook.)

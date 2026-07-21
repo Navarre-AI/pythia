@@ -9,7 +9,7 @@ The living rulebook. These are enforced in the model's system prompts (server.js
 4. **Plain, warm, business English.** The user is a report person, not a developer.
 
 ## Data integrity
-5. **Numbers come from the data, never the model** (zero hallucination): the server injects real query rows; the model chooses which query feeds which chart, and writes narrative.
+5. **Numbers come from the data, never the model**: the server injects real query rows; the model chooses which query feeds which chart, and writes narrative.
 6. **Be honest about gaps.** If the data can't answer something (a field that's rarely filled in, a link that doesn't exist), say so and offer the closest thing, don't draw a misleading chart.
 7. **No domain assumptions.** Pythia is general-purpose: everything the model knows about the data comes from the connected schema at runtime, never from anything baked into the code.
 
